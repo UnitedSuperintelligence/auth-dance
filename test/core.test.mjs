@@ -67,3 +67,31 @@ test('existing-store recovery adapter bounds replays and preserves failures',asy
  await assert.rejects(r.execute('stale',async()=>{throw Error('auth');},()=>true,false),/NOT_REPLAYED/);
  requests=0;await assert.rejects(r.execute('stale',async()=>{requests++;throw Error('auth');},()=>true,true),/auth/);assert.equal(requests,2);
 });
+test('HTTP 401 recovers once; HTTP 403 and synthetic mutations do not replay',async t=>{
+ let reads=0,writes=0,denied=0,logins=0;
+ const server=createServer((req,res)=>{
+  if(req.url==='/denied'){denied++;res.statusCode=403;}
+  else if(req.method==='POST'){writes++;res.statusCode=401;}
+  else {reads++;res.statusCode=req.headers.authorization==='Bearer fixture-1'?401:200;}
+  res.end('{}');
+ });
+ await new Promise(r=>server.listen(0,'127.0.0.1',r));t.after(()=>server.close());
+ const manager=new TokenManager(new FileTokenStore(join(await temp(),'state')),{login:async()=>({accessToken:`fixture-${++logins}`})});
+ const client=createAuthenticatedClient(manager,{origin:`http://127.0.0.1:${server.address().port}`,allowHttpLocalhost:true});
+ assert.equal((await client.request({path:'/read'})).status,200);assert.equal(reads,2);assert.equal(logins,2);
+ assert.equal((await client.request({path:'/denied'})).status,403);assert.equal(denied,1);assert.equal(logins,2);
+ await assert.rejects(client.request({path:'/write',method:'POST',data:{fictional:true}}),/NOT_REPLAYED/);assert.equal(writes,1);assert.equal(logins,3);
+});
+test('refresh fallback requires explicit invalid credential and logs stay static',async()=>{
+ const store=new FileTokenStore(join(await temp(),'state'));await store.exclusive(()=>store.compareAndSwap(0,{generation:1,session:{accessToken:'fixture',refreshToken:'fictional-refresh',expiresAt:1}}));
+ let login=0;const logs=[];
+ const provider={login:async()=>{login++;return {accessToken:'renewed'};},refresh:async()=>{throw Error('private-content');}};
+ const m=new TokenManager(store,provider,{log:e=>logs.push(e),cooldownMs:0});
+ await assert.rejects(m.execute(async()=>200,()=>false,true),/AUTH_FAILED/);assert.equal(login,0);assert.equal(JSON.stringify(logs).includes('private-content'),false);
+ provider.isRefreshRejected=()=>true;assert.equal(await m.execute(async()=>200,()=>false,true),200);assert.equal(login,1);
+});
+test('SQLite coordinates independent processes',async()=>{
+ const dir=await temp();const module=new URL('../dist/index.js',import.meta.url).href;
+ const script=`import {SqliteTokenStore,TokenManager} from ${JSON.stringify(module)};import {appendFile} from 'node:fs/promises';const store=new SqliteTokenStore(${JSON.stringify(join(dir,'state'))});const m=new TokenManager(store,{login:async()=>{await appendFile(${JSON.stringify(join(dir,'calls'))},'1');await new Promise(r=>setTimeout(r,100));return {accessToken:'fake'};}});await m.execute(async()=>200,()=>false,true);store.close();`;
+ await Promise.all(Array.from({length:4},()=>child(['--input-type=module','-e',script])));assert.equal(await readFile(join(dir,'calls'),'utf8'),'1');
+});
