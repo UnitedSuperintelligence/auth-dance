@@ -101,3 +101,12 @@ TokenStore implementation; the included SQLite store is local only.
 
 Tests use fictional credentials and loopback fixtures, including concurrent child
 processes, refresh rotation, CAS, bounded replay, cooldown and all three entrypoints.
+
+## Existing coordinated stores
+
+`RecoveryCoordinator` is a small integration adapter for an application that already
+has a provider-specific, cross-process coordinated credential store. Its acquisition
+callback owns credential publication and cooldown; the coordinator owns classification,
+one recovery attempt, mutation replay policy and propagation of retry failures.
+It does not add distributed locking to an uncoordinated callback. This permits adoption
+without migrating existing encrypted credentials, Redis keys or account partitions.
